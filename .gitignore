@@ -1,0 +1,21 @@
+# R/RStudio
+.Rproj.user/
+.Rhistory
+.RData
+.Ruserdata
+.Rproj.user/
+*.Rproj
+
+# Quarto / knitr caches
+*_files/
+*_cache/
+.qmd/**/*.tex
+/.quarto/
+
+# OS/Editor
+.DS_Store
+Thumbs.db
+
+# Local data & secrets
+data/
+.env

@@ -1,0 +1,128 @@
+---
+title: "COVID-19 Case Surveillance — Colorado Summary (CDC/SoQL)"
+author: "Kai Leleiwi"
+format:
+  pdf:
+    toc: true
+    number-sections: false
+execute:
+  echo: false
+  warning: false
+  message: false
+---
+
+```{r}
+library(httr)
+library(jsonlite)
+library(dplyr)
+library(ggplot2)
+library(lubridate)
+library(tidyr)
+
+#soql function fetch
+cdc_fetch <- function(soql, 
+                      domain = "data.cdc.gov", 
+                      view = "n8mc-b4w4", 
+                      token_env = "SOCRATA_APP_TOKEN") { 
+  
+  base <- sprintf("https://%s/resource/%s.json", domain, view) 
+  hdrs <- ifelse(nzchar(Sys.getenv(token_env)), 
+                 add_headers("X-App-Token" = Sys.getenv(token_env)), 
+                 NULL)
+  
+  url  <- modify_url(base, query = list(`$query` = soql))
+  resp <- GET(url, hdrs, timeout(60))
+  stop_for_status(resp)
+  txt  <- content(resp, as = "raw")
+  txt  <- rawToChar(txt); Encoding(txt) <- "UTF-8"
+  fromJSON(txt, simplifyVector = TRUE) |> as_tibble()
+}
+
+#sql queries for select data
+#cases in colorado grouped by month
+co_month <- cdc_fetch("
+  SELECT case_month, count(1) AS n
+  WHERE res_state = 'CO'
+  GROUP BY case_month
+  ORDER BY case_month
+") |>
+  mutate(case_month = as.Date(case_month))
+
+#cases in colorado by age
+by_age <- cdc_fetch("
+  SELECT case_month, age_group, count(1) AS n
+  WHERE res_state = 'CO'
+  GROUP BY case_month, age_group
+  ORDER BY case_month, age_group
+") |>
+  mutate(case_month = as.Date(case_month)) |>
+  filter(!is.na(age_group) & age_group != "Missing")
+
+#hospitilization 
+severe <- cdc_fetch("
+  SELECT case_month,
+    sum(case(hosp_yn = 'Yes', 1, 0))  AS hosp_n,
+    sum(case(death_yn = 'Yes', 1, 0)) AS death_n,
+    count(1)                           AS n
+  WHERE res_state = 'CO'
+  GROUP BY case_month
+  ORDER BY case_month
+") |>
+  mutate(case_month = as.Date(case_month),
+         hosp_rate  = as.numeric(hosp_n) / as.numeric(n),
+         death_rate = as.numeric(death_n) / as.numeric(n))
+```
+
+## Data & Methods
+
+-   Source: CDC **COVID-19 Case Surveillance Public Use with Geography** (`n8mc-b4w4`), accessed via Socrata SODA v2 (`/resource/<id>.json?$query=…`).
+
+-   We **push filters/aggregation to the API** with **SoQL** to avoid downloading row-level data.
+
+-   Metrics: monthly counts; age-group distributions; hospitalization & death ratios (conditional sums).\
+    *Refs:* CDC API Foundry & SoQL docs.
+
+```{r}
+summary(co_month)
+summary(by_age)
+summary(severe)
+```
+
+## Colorado monthly cases
+
+```{r}
+ggplot(co_month, aes(case_month, as.numeric(n))) +
+  geom_line() +
+  labs(x = NULL, y = "Cases (monthly total)", title = "Colorado — monthly case counts") +
+  theme_minimal()
+
+```
+
+## Age distribution over time
+
+```{r}
+by_age |> group_by(case_month) |>
+  mutate(pct = as.numeric(n) / sum(as.numeric(n))) |>
+  ggplot(aes(case_month, pct, fill = age_group)) +
+  geom_area() +
+  scale_y_continuous(labels = scales::percent) +
+  labs(x = NULL, y = "Share of monthly cases", fill = "Age group",
+       title = "Colorado — age distribution of cases") +
+  theme_minimal()
+
+```
+
+## Severity proxies (hospitalization and death ratios)
+
+```{r}
+severe_long <- severe |>
+  select(case_month, hosp_rate, death_rate) |>
+  pivot_longer(-case_month, names_to = "metric", values_to = "rate")
+ggplot(severe_long, aes(case_month, rate, color = metric)) +
+  geom_line() +
+  scale_y_continuous(labels = scales::percent) +
+  labs(x = NULL, y = "Rate", color = NULL,
+       title = "Colorado — hospitalization and death ratios among reported cases") +
+  theme_minimal()
+
+```
