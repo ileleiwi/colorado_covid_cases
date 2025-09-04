@@ -1,6 +1,6 @@
 ---
 title: "COVID-19 Case Surveillance — Colorado Summary (CDC/SoQL)"
-author: "Kai Leleiwi"
+author: "Ikaia Leleiwi"
 format:
   pdf:
     toc: true
@@ -12,65 +12,109 @@ execute:
 ---
 
 ```{r}
+#| label: r-fetch-fn
+#| eval: true
+#| message: false
+#| warning: false
+
+# ---- packages ----
 library(httr)
 library(jsonlite)
 library(dplyr)
-library(ggplot2)
-library(lubridate)
 library(tidyr)
+library(lubridate)
+library(ggplot2)
+library(tibble)
+library(sf)
+library(tigris)
+library(leaflet)
+library(scales)
 
-#soql function fetch
-cdc_fetch <- function(soql, 
-                      domain = "data.cdc.gov", 
-                      view = "n8mc-b4w4", 
-                      token_env = "SOCRATA_APP_TOKEN") { 
-  
-  base <- sprintf("https://%s/resource/%s.json", domain, view) 
-  hdrs <- ifelse(nzchar(Sys.getenv(token_env)), 
-                 add_headers("X-App-Token" = Sys.getenv(token_env)), 
-                 NULL)
-  
-  url  <- modify_url(base, query = list(`$query` = soql))
-  resp <- GET(url, hdrs, timeout(60))
-  stop_for_status(resp)
-  txt  <- content(resp, as = "raw")
-  txt  <- rawToChar(txt); Encoding(txt) <- "UTF-8"
-  fromJSON(txt, simplifyVector = TRUE) |> as_tibble()
+#global options
+options(tigris_use_cache = TRUE)
+options(timeout = 180)
+# ---- constants (adjust only if you change dataset/domain) ----
+CDC_DOMAIN <- "data.cdc.gov"
+CDC_VIEW   <- "n8mc-b4w4"
+TOKEN_ENV  <- "SOCRATA_APP_TOKEN_CDC"  # set this in ~/.Renviron or project .Renviron (git-ignored)
+
+cdc_fetch2 <- function(
+  url_base = "https://data.cdc.gov/resource/n8mc-b4w4.json",
+  query = list(),
+  token_env = "SOCRATA_APP_TOKEN_CDC",
+  total_timeout_sec = 90,
+  tries = 5
+) {
+  tok <- trimws(Sys.getenv(token_env, ""))
+  hdr <- if (nzchar(tok)) add_headers("X-App-Token" = tok) else NULL
+
+  resp <- RETRY("GET", url_base, hdr,
+                query = query,
+                user_agent("kai-cdc-quarto/1.0"),
+                timeout(total_timeout_sec),
+                times = tries, pause_base = 1, pause_cap = 12)
+
+  # If auth failure, retry with $$app_token query param (some networks strip headers)
+  if (status_code(resp) %in% c(401,403) && nzchar(tok)) {
+    resp <- RETRY("GET", url_base,
+                  query = c(query, `$$app_token` = tok),
+                  user_agent("kai-cdc-quarto/1.0"),
+                  timeout(total_timeout_sec),
+                  times = tries, pause_base = 1, pause_cap = 12)
+  }
+
+  raw <- content(resp, as = "raw")
+  txt <- if (length(raw)) { x <- rawToChar(raw); Encoding(x) <- "UTF-8"; x } else ""
+  if (http_error(resp)) stop(sprintf("CDC API HTTP %s after retries. First 300:\n%s",
+                                     status_code(resp), substr(txt, 1, 300)))
+  tryCatch(jsonlite::fromJSON(txt, simplifyVector = TRUE),
+           error = function(e) stop(sprintf("JSON parse failed. First 300:\n%s",
+                                            substr(txt, 1, 300)))) |>
+    tibble::as_tibble()
 }
 
-#sql queries for select data
-#cases in colorado grouped by month
-co_month <- cdc_fetch("
-  SELECT case_month, count(1) AS n
-  WHERE res_state = 'CO'
-  GROUP BY case_month
-  ORDER BY case_month
-") |>
-  mutate(case_month = as.Date(case_month))
+# Helper that BUILDS $select/$where/$group/$order correctly (no keywords)
+cdc_select <- function(
+  select,
+  where = NULL,
+  group = NULL,
+  order = NULL,
+  limit = NULL,
+  token_env = "SOCRATA_APP_TOKEN_CDC"
+) {
+  # strip accidental SQL keywords if they sneak in
+  clean <- function(x, which) {
+    if (is.null(x) || !nzchar(x)) return("")
+    pat <- switch(which,
+                  select = "^\\s*(?i)select\\s+",
+                  where  = "^\\s*(?i)where\\s+",
+                  group  = "^\\s*(?i)group\\s+by\\s+",
+                  order  = "^\\s*(?i)order\\s+by\\s+")
+    sub(pat, "", x, perl = TRUE)
+  }
+  q <- list(`$select` = clean(select, "select"))
+  w <- clean(where, "where"); if (nzchar(w)) q$`$where` <- w
+  g <- clean(group, "group"); if (nzchar(g)) q$`$group` <- g
+  o <- clean(order, "order"); if (nzchar(o)) q$`$order` <- o
+  if (!is.null(limit)) q$`$limit` <- as.integer(limit)
 
-#cases in colorado by age
-by_age <- cdc_fetch("
-  SELECT case_month, age_group, count(1) AS n
-  WHERE res_state = 'CO'
-  GROUP BY case_month, age_group
-  ORDER BY case_month, age_group
-") |>
-  mutate(case_month = as.Date(case_month)) |>
-  filter(!is.na(age_group) & age_group != "Missing")
+  # IMPORTANT: use cdc_fetch2 (NOT cdc_fetch)
+  cdc_fetch2(query = q, token_env = token_env)
+}
 
-#hospitilization 
-severe <- cdc_fetch("
-  SELECT case_month,
-    sum(case(hosp_yn = 'Yes', 1, 0))  AS hosp_n,
-    sum(case(death_yn = 'Yes', 1, 0)) AS death_n,
-    count(1)                           AS n
-  WHERE res_state = 'CO'
-  GROUP BY case_month
-  ORDER BY case_month
-") |>
-  mutate(case_month = as.Date(case_month),
-         hosp_rate  = as.numeric(hosp_n) / as.numeric(n),
-         death_rate = as.numeric(death_n) / as.numeric(n))
+# optional: simple on-disk cache so you don’t re-hit CDC during knit
+cache_get <- function(key, expr) {
+  dir.create("cache", showWarnings = FALSE)
+  f <- file.path("cache", paste0(gsub("[^A-Za-z0-9_-]", "_", key), ".rds"))
+  if (file.exists(f)) readRDS(f) else { val <- force(expr); saveRDS(val, f); val }
+}
+
+
+#pull row field names for later chunks
+one_row <- cdc_fetch2(query = list(`$limit` = 1))
+names(one_row)
+str(one_row)
+
 ```
 
 ## Data & Methods
@@ -83,9 +127,149 @@ severe <- cdc_fetch("
     *Refs:* CDC API Foundry & SoQL docs.
 
 ```{r}
+#| label: r-data-queries
+#| eval: true
+#| message: true
+
+# assumes you've already defined cdc_fetch2() and cdc_select() in your setup chunk
+stopifnot(exists("cdc_fetch2"), exists("cdc_select"))
+
+suppressPackageStartupMessages({
+  library(dplyr); library(tidyr); library(lubridate)
+})
+
+# simple on-disk cache (safe no-op if you already defined it)
+if (!exists("cache_get")) {
+  cache_get <- function(key, expr) {
+    dir.create("cache", showWarnings = FALSE)
+    f <- file.path("cache", paste0(gsub("[^A-Za-z0-9_-]", "_", key), ".rds"))
+    if (file.exists(f)) readRDS(f) else { val <- force(expr); saveRDS(val, f); val }
+  }
+}
+
+options(timeout = 45)  # don't let any single HTTP call hang forever
+
+# ---- Monthly totals (CO) ----
+co_month <- cache_get(
+  "co_month",
+  cdc_select(
+    select = "case_month, count(1) as n",
+    where  = "res_state = 'CO'",
+    group  = "case_month",
+    order  = "case_month",
+    limit  = 5000
+  ) |>
+    mutate(
+      case_month = as.Date(paste0(case_month, "-01")),
+      n = as.numeric(n)
+    )
+)
+
+# ---- By age group (CO) ----
+by_age <- cache_get(
+  "co_by_age",
+  cdc_select(
+    select = "case_month, age_group, count(1) as n",
+    where  = "res_state = 'CO' AND age_group IS NOT NULL AND age_group <> 'Missing'",
+    group  = "case_month, age_group",
+    order  = "case_month, age_group",
+    limit  = 50000
+  ) |>
+    mutate(
+      case_month = as.Date(paste0(case_month, "-01")),
+      n = as.numeric(n)
+    )
+)
+
+# ---- Severity proxies (run separate grouped queries; join in R) ----
+count_by_month <- function(where_extra = NULL, limit = 50000) {
+  where_clause <- paste(c("res_state = 'CO'", where_extra), collapse = " AND ")
+  cdc_select(
+    select = "case_month, count(1) as n",
+    where  = where_clause,
+    group  = "case_month",
+    order  = "case_month",
+    limit  = limit
+  ) |>
+    mutate(
+      case_month = as.Date(paste0(case_month, "-01")),
+      n = as.numeric(n)
+    )
+}
+
+co_total <- count_by_month()
+
+co_hosp <- count_by_month("hosp_yn = 'Yes'") |>
+  rename(hosp_n = n)
+
+co_death <- count_by_month("death_yn = 'Yes'") |>
+  rename(death_n = n)
+
+severe <- co_total |>
+  full_join(co_hosp,  by = "case_month") |>
+  full_join(co_death, by = "case_month") |>
+  mutate(
+    hosp_n     = replace_na(hosp_n, 0),
+    death_n    = replace_na(death_n, 0),
+    hosp_rate  = if_else(n > 0, hosp_n / n, NA_real_),
+    death_rate = if_else(n > 0, death_n / n, NA_real_)
+  ) |>
+  arrange(case_month)
+
+# ---- County totals (CO) ----
+co_county <- cache_get(
+  "co_county",
+  cdc_select(
+    select = "county_fips_code, res_county, count(1) as n",
+    where  = "res_state = 'CO' AND county_fips_code IS NOT NULL",
+    group  = "county_fips_code, res_county",
+    order  = "n DESC",
+    limit  = 10000
+  ) |>
+    mutate(
+      county_fips_code = sprintf("%05s", county_fips_code),
+      n = as.numeric(n)
+    )
+)
+
+# ---- County x Month (CO) — slice by year; no server ORDER; join names locally ----
+county_by_year <- function(y) {
+  cdc_select(
+    select = "case_month, county_fips_code, count(1) as n",
+    where  = sprintf("res_state = 'CO' AND county_fips_code IS NOT NULL AND case_month between '%d-01' and '%d-12'", y, y),
+    group  = "case_month, county_fips_code",
+    limit  = 120000
+  ) |>
+    mutate(
+      case_month       = as.Date(paste0(case_month, "-01")),
+      county_fips_code = sprintf("%05s", county_fips_code),
+      n                = as.numeric(n)
+    )
+}
+
+years <- 2020:2024
+co_county_month_list <- lapply(years, function(y) {
+  message("Fetching county-month slice for ", y, " …")
+  cache_get(paste0("co_county_month_", y), county_by_year(y))
+})
+
+co_county_month <- bind_rows(co_county_month_list) |>
+  arrange(case_month, county_fips_code) |>
+  # add county names from the totals table (lighter than asking SODA to return it per row)
+  left_join(
+    co_county |>
+      select(county_fips_code, res_county) |>
+      distinct(),
+    by = "county_fips_code"
+  )
+
+# ---- Quick summaries ----
 summary(co_month)
 summary(by_age)
 summary(severe)
+summary(co_county)
+summary(co_county_month)
+
 ```
 
 ## Colorado monthly cases
@@ -101,8 +285,11 @@ ggplot(co_month, aes(case_month, as.numeric(n))) +
 ## Age distribution over time
 
 ```{r}
-by_age |> group_by(case_month) |>
-  mutate(pct = as.numeric(n) / sum(as.numeric(n))) |>
+by_age |> 
+  group_by(case_month) |>
+  mutate(pct = as.numeric(n) / sum(as.numeric(n)),
+         age_group = ifelse(age_group == "NA", "No age data", age_group)) |>
+  #filter(age_group != "NA") |>
   ggplot(aes(case_month, pct, fill = age_group)) +
   geom_area() +
   scale_y_continuous(labels = scales::percent) +
@@ -115,14 +302,63 @@ by_age |> group_by(case_month) |>
 ## Severity proxies (hospitalization and death ratios)
 
 ```{r}
-severe_long <- severe |>
+severe |>
   select(case_month, hosp_rate, death_rate) |>
-  pivot_longer(-case_month, names_to = "metric", values_to = "rate")
-ggplot(severe_long, aes(case_month, rate, color = metric)) +
+  pivot_longer(-case_month, 
+               names_to = "metric", 
+               values_to = "rate") |>
+  ggplot(aes(case_month, rate, color = metric)) +
   geom_line() +
   scale_y_continuous(labels = scales::percent) +
   labs(x = NULL, y = "Rate", color = NULL,
        title = "Colorado — hospitalization and death ratios among reported cases") +
   theme_minimal()
+
+```
+
+## Get Colorado country geometry and centroids (lat/long)
+
+```{r}
+co_sf <- tigris::counties(state = "CO", year = 2023, class = "sf") |>
+  dplyr::select(GEOID, NAME, geometry)  # GEOID == 5-digit county FIPS
+
+# Centroids for point mapping
+co_cent <- sf::st_point_on_surface(co_sf) |>
+  dplyr::mutate(
+    lon = sf::st_coordinates(geometry)[,1],
+    lat = sf::st_coordinates(geometry)[,2]
+  ) |>
+  sf::st_drop_geometry() |>
+  dplyr::select(GEOID, lat, lon)
+
+co_geo <- co_county |>
+  dplyr::rename(GEOID = county_fips_code,
+                county = res_county) |>
+  dplyr::left_join(co_cent, by = "GEOID")
+
+```
+
+## Bubble map
+
+```{r}
+leaflet(co_geo) |>
+  addTiles() |>
+  addCircleMarkers(
+    lng = ~lon, lat = ~lat,
+    radius = ~rescale(n, to = c(4, 14)),
+    stroke = FALSE, fillOpacity = 0.75,
+    label = ~paste0(county, ": ", comma(n), " cases")
+  )
+
+co_choro <- co_sf |>
+  dplyr::left_join(co_county, by = c("GEOID" = "county_fips_code"))
+
+leaflet(co_choro) |>
+  addTiles() |>
+  addPolygons(
+    fillColor = ~colorBin("YlOrRd", domain = co_choro$n, bins = 7)(n),
+    fillOpacity = 0.7, weight = 0.5, color = "#666",
+    label = ~paste0(NAME, ": ", scales::comma(n))
+  )
 
 ```
