@@ -15,6 +15,9 @@ suppressPackageStartupMessages({
   library(readr)
 })
 
+options(shiny.sanitize.errors = FALSE)
+
+
 # -------------------------------
 # Optional: live API helpers (leave commented if you want cache-only)
 # -------------------------------
@@ -101,6 +104,7 @@ if (length(yr_files) == 0L) {
 }
 
 # Optional severity cache (if you saved one during Quarto)
+
 severe_path <- "cache/severe.rds"
 severe <- if (file.exists(severe_path)) {
   readRDS(severe_path) |>
@@ -232,7 +236,7 @@ ui <- page_navbar(
         ),
         p("To refresh data, re-run the Quarto analysis (or uncomment the API helpers above and run this app with a CDC token set as ",
           code("SOCRATA_APP_TOKEN_CDC"), ")."),
-        p("Author: Kai Leleiwi • GitHub repo: add your link here.")
+        p("Author: Ikaia Leleiwi • GitHub repo: https://github.com/ileleiwi/colorado_covid_cases")
       )
     )
   )
@@ -241,6 +245,14 @@ ui <- page_navbar(
 # -------------------------------
 # Server
 # -------------------------------
+label_si_safe <- function() {
+  if ("label_number_si" %in% getNamespaceExports("scales")) {
+    scales::label_number_si()
+  } else {
+    scales::comma
+  }
+}
+
 server <- function(input, output, session) {
 
   # ---- reactive filters ----
@@ -279,30 +291,32 @@ server <- function(input, output, session) {
 
   # ---- plots ----
   output$plot_cases <- renderPlot({
-    df <- req(co_month_f())
-    ggplot(df, aes(case_month, as.numeric(n))) +
-      geom_line(linewidth = 0.8) +
-      scale_y_continuous(labels = label_number_si()) +
-      labs(x = NULL, y = "Monthly cases", title = NULL) +
-      theme_minimal(base_size = 13)
-  })
+  df <- req(co_month_f())
+  validate(need(nrow(df) > 0, "No data for the selected range."))
 
-  output$plot_severe <- renderPlot({
+  ggplot(df, aes(case_month, as.numeric(n))) +
+    geom_line(size = 0.8) +                             # <-- size, not linewidth
+    scale_y_continuous(labels = label_si_safe()) +      # <-- robust label
+    labs(x = NULL, y = "Monthly cases") +
+    theme_minimal(base_size = 13)
+    })
+
+    output$plot_severe <- renderPlot({
     req(severe)
     df <- severe |>
-      filter(case_month >= input$date_range[1],
-             case_month <= input$date_range[2]) |>
-      select(case_month, hosp_rate, death_rate) |>
-      pivot_longer(-case_month, names_to = "metric", values_to = "rate")
+        dplyr::filter(case_month >= input$date_range[1],
+                    case_month <= input$date_range[2]) |>
+        tidyr::pivot_longer(-case_month, names_to = "metric", values_to = "rate",
+                            cols = c(hosp_rate, death_rate))
 
     ggplot(df, aes(case_month, rate, color = metric)) +
-      geom_line(linewidth = 0.8) +
-      scale_y_continuous(labels = percent_format(accuracy = 0.1)) +
-      scale_color_manual(NULL, values = c("#2c7fb8", "#d95f0e"),
-                         labels = c("Death ratio", "Hospitalization ratio")) +
-      labs(x = NULL, y = "Rate", title = NULL) +
-      theme_minimal(base_size = 13)
-  })
+        geom_line(size = 0.8) +                             # <-- size, not linewidth
+        scale_y_continuous(labels = scales::percent_format(accuracy = 0.1)) +
+        scale_color_manual(NULL, values = c("#2c7fb8", "#d95f0e"),
+                        labels = c("Death ratio", "Hospitalization ratio")) +
+        labs(x = NULL, y = "Rate") +
+        theme_minimal(base_size = 13)
+    })
 
   output$plot_age_area <- renderPlot({
     df <- req(by_age_f()) |>
