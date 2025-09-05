@@ -1,5 +1,5 @@
 # Colorado COVID case surveillance (CDC Socrata) — Shiny
-# Assumes cached RDS files under ./cache produced by your Quarto analysis:
+# Expects cached RDS files under ./cache produced by your Quarto analysis:
 #   co_month.rds, co_by_age.rds, co_county.rds, co_county_month_YYYY.rds, [optional] severe.rds
 
 suppressPackageStartupMessages({
@@ -15,58 +15,8 @@ suppressPackageStartupMessages({
   library(readr)
 })
 
+# Show real errors during development
 options(shiny.sanitize.errors = FALSE)
-
-
-# -------------------------------
-# Optional: live API helpers (leave commented if you want cache-only)
-# -------------------------------
-# library(httr); library(jsonlite); library(tibble)
-# cdc_fetch2 <- function(
-#   url_base = "https://data.cdc.gov/resource/n8mc-b4w4.json",
-#   query = list(),
-#   token_env = "SOCRATA_APP_TOKEN_CDC",
-#   total_timeout_sec = 90,
-#   tries = 5
-# ) {
-#   tok <- trimws(Sys.getenv(token_env, ""))
-#   hdr <- if (nzchar(tok)) add_headers("X-App-Token" = tok) else NULL
-#   resp <- RETRY("GET", url_base, hdr,
-#                 query = query, user_agent("kai-cdc-shiny/1.0"),
-#                 timeout(total_timeout_sec), times = tries,
-#                 pause_base = 1, pause_cap = 12)
-#   if (status_code(resp) %in% c(401,403) && nzchar(tok)) {
-#     resp <- RETRY("GET", url_base,
-#                   query = c(query, `$$app_token` = tok),
-#                   user_agent("kai-cdc-shiny/1.0"),
-#                   timeout(total_timeout_sec), times = tries,
-#                   pause_base = 1, pause_cap = 12)
-#   }
-#   raw <- content(resp, as = "raw")
-#   txt <- if (length(raw)) { x <- rawToChar(raw); Encoding(x) <- "UTF-8"; x } else ""
-#   if (http_error(resp)) stop(sprintf("CDC API HTTP %s after retries. First 300:\n%s",
-#                                      status_code(resp), substr(txt, 1, 300)))
-#   as_tibble(jsonlite::fromJSON(txt, simplifyVector = TRUE))
-# }
-# cdc_select <- function(select, where=NULL, group=NULL, order=NULL, limit=NULL,
-#                        token_env = "SOCRATA_APP_TOKEN_CDC") {
-#   clean <- function(x, which) {
-#     if (is.null(x) || !nzchar(x)) return("")
-#     pat <- switch(which,
-#       select = "^\\s*(?i)select\\s+",
-#       where  = "^\\s*(?i)where\\s+",
-#       group  = "^\\s*(?i)group\\s+by\\s+",
-#       order  = "^\\s*(?i)order\\s+by\\s+"
-#     )
-#     sub(pat, "", x, perl = TRUE)
-#   }
-#   q <- list(`$select` = clean(select, "select"))
-#   w <- clean(where, "where"); if (nzchar(w)) q$`$where` <- w
-#   g <- clean(group, "group"); if (nzchar(g)) q$`$group` <- g
-#   o <- clean(order, "order"); if (nzchar(o)) q$`$order` <- o
-#   if (!is.null(limit)) q$`$limit` <- as.integer(limit)
-#   cdc_fetch2(query = q, token_env = token_env)
-# }
 
 # -------------------------------
 # Data loading from cache
@@ -76,26 +26,35 @@ cache_read <- function(path) {
   readRDS(path)
 }
 
-# Required cached frames
-co_month  <- cache_read("cache/co_month.rds")  |> mutate(case_month = as.Date(case_month))
-co_by_age <- cache_read("cache/co_by_age.rds") |> mutate(case_month = as.Date(case_month))
-co_county <- cache_read("cache/co_county.rds") |> mutate(n = as.numeric(n),
-                                                         county_fips_code = sprintf("%05s", county_fips_code))
+# Required cached frames (coerce numerics immediately)
+co_month <- cache_read("cache/co_month.rds") |>
+  dplyr::mutate(case_month = as.Date(case_month),
+                n = suppressWarnings(as.numeric(n)))
+
+co_by_age <- cache_read("cache/co_by_age.rds") |>
+  dplyr::mutate(case_month = as.Date(case_month),
+                n = suppressWarnings(as.numeric(n)))
+
+co_county <- cache_read("cache/co_county.rds") |>
+  dplyr::mutate(n = suppressWarnings(as.numeric(n)),
+                county_fips_code = sprintf("%05s", county_fips_code))
 
 # County x month: bind yearly slices present in cache
 yr_files <- list.files("cache", pattern = "^co_county_month_\\d{4}\\.rds$", full.names = TRUE)
 if (length(yr_files) == 0L) {
   warning("No county-month cache files found (co_county_month_YYYY.rds). County Explorer will be limited.")
-  co_county_month <- tibble(case_month = as.Date(character()),
-                            county_fips_code = character(),
-                            n = numeric(),
-                            res_county = character())
+  co_county_month <- tibble::tibble(
+    case_month = as.Date(character()),
+    county_fips_code = character(),
+    n = numeric(),
+    res_county = character()
+  )
 } else {
   co_county_month <- map_dfr(yr_files, readRDS) |>
     mutate(
       case_month = as.Date(case_month),
       county_fips_code = sprintf("%05s", county_fips_code),
-      n = as.numeric(n)
+      n = suppressWarnings(as.numeric(n))
     ) |>
     # add county names from totals (lighter than returning from API)
     left_join(co_county |> select(county_fips_code, res_county) |> distinct(),
@@ -104,7 +63,6 @@ if (length(yr_files) == 0L) {
 }
 
 # Optional severity cache (if you saved one during Quarto)
-
 severe_path <- "cache/severe.rds"
 severe <- if (file.exists(severe_path)) {
   readRDS(severe_path) |>
@@ -121,11 +79,11 @@ age_opts <- sort(unique(na.omit(co_by_age$age_group)))
 # Theming
 # -------------------------------
 app_theme <- bs_theme(
-  version   = 5,
-  bootswatch = "flatly",
-  primary   = "#0d6efd",
-  base_font = font_google("Inter", local = TRUE),
-  heading_font = font_google("Inter", local = TRUE)
+  version     = 5,
+  bootswatch  = "flatly",
+  primary     = "#0d6efd",
+  base_font   = font_google("Inter", local = TRUE),
+  heading_font= font_google("Inter", local = TRUE)
 )
 
 # -------------------------------
@@ -234,7 +192,7 @@ ui <- page_navbar(
           tags$li(code("cache/co_county_month_YYYY.rds"), " — county×month slices"),
           tags$li(code("cache/severe.rds"), " — optional hospitalization/death ratios by month")
         ),
-        p("To refresh data, re-run the Quarto analysis (or uncomment the API helpers above and run this app with a CDC token set as ",
+        p("To refresh data, re-run the Quarto analysis (or uncomment the API helpers and run this app with a CDC token set as ",
           code("SOCRATA_APP_TOKEN_CDC"), ")."),
         p("Author: Ikaia Leleiwi • GitHub repo: https://github.com/ileleiwi/colorado_covid_cases")
       )
@@ -243,8 +201,9 @@ ui <- page_navbar(
 )
 
 # -------------------------------
-# Server
+# Helpers + Server
 # -------------------------------
+# robust label helper (works on older/newer 'scales')
 label_si_safe <- function() {
   if ("label_number_si" %in% getNamespaceExports("scales")) {
     scales::label_number_si()
@@ -259,28 +218,30 @@ server <- function(input, output, session) {
   co_month_f <- reactive({
     req(input$date_range)
     co_month |>
-      filter(case_month >= input$date_range[1],
-             case_month <= input$date_range[2])
+      dplyr::filter(case_month >= input$date_range[1],
+                    case_month <= input$date_range[2]) |>
+      dplyr::mutate(n = suppressWarnings(as.numeric(n)))
   })
 
   by_age_f <- reactive({
     req(input$date_range)
     co_by_age |>
-      filter(case_month >= input$date_range[1],
-             case_month <= input$date_range[2],
-             age_group %in% input$age_sel)
+      dplyr::filter(case_month >= input$date_range[1],
+                    case_month <= input$date_range[2],
+                    age_group %in% input$age_sel) |>
+      dplyr::mutate(n = suppressWarnings(as.numeric(n)))
   })
 
   selected_month_df <- reactive({
     req(input$month_pick)
     co_county_month |>
-      filter(case_month == as.Date(input$month_pick)) |>
-      arrange(desc(n))
+      dplyr::filter(case_month == as.Date(input$month_pick)) |>
+      dplyr::arrange(dplyr::desc(n))
   })
 
   observe({
-    # Build county picker choices once we know we have the data
-    updateSelectizeInput(session, "county_pick", choices = unique(co_county$res_county), server = TRUE)
+    updateSelectizeInput(session, "county_pick",
+      choices = unique(co_county$res_county), server = TRUE)
   })
 
   output$county_picker_ui <- renderUI({
@@ -291,56 +252,56 @@ server <- function(input, output, session) {
 
   # ---- plots ----
   output$plot_cases <- renderPlot({
-  df <- req(co_month_f())
-  validate(need(nrow(df) > 0, "No data for the selected range."))
+    df <- req(co_month_f())
+    validate(need(nrow(df) > 0, "No data for the selected range."))
 
-  ggplot(df, aes(case_month, as.numeric(n))) +
-    geom_line(size = 0.8) +                             # <-- size, not linewidth
-    scale_y_continuous(labels = label_si_safe()) +      # <-- robust label
-    labs(x = NULL, y = "Monthly cases") +
-    theme_minimal(base_size = 13)
-    })
+    ggplot(df, aes(x = case_month, y = n)) +
+      geom_line(size = 0.8) +
+      scale_y_continuous(labels = label_si_safe()) +
+      labs(x = NULL, y = "Monthly cases") +
+      theme_minimal(base_size = 13)
+  })
 
-    output$plot_severe <- renderPlot({
+  output$plot_severe <- renderPlot({
     req(severe)
     df <- severe |>
-        dplyr::filter(case_month >= input$date_range[1],
+      dplyr::filter(case_month >= input$date_range[1],
                     case_month <= input$date_range[2]) |>
-        tidyr::pivot_longer(-case_month, names_to = "metric", values_to = "rate",
-                            cols = c(hosp_rate, death_rate))
+      tidyr::pivot_longer(dplyr::all_of(c("hosp_rate","death_rate")),
+                          names_to = "metric", values_to = "rate")
 
     ggplot(df, aes(case_month, rate, color = metric)) +
-        geom_line(size = 0.8) +                             # <-- size, not linewidth
-        scale_y_continuous(labels = scales::percent_format(accuracy = 0.1)) +
-        scale_color_manual(NULL, values = c("#2c7fb8", "#d95f0e"),
-                        labels = c("Death ratio", "Hospitalization ratio")) +
-        labs(x = NULL, y = "Rate") +
-        theme_minimal(base_size = 13)
-    })
+      geom_line(size = 0.8) +
+      scale_y_continuous(labels = scales::percent_format(accuracy = 0.1)) +
+      scale_color_manual(NULL, values = c("#2c7fb8", "#d95f0e"),
+                         labels = c("Hospitalization ratio", "Death ratio")) +
+      labs(x = NULL, y = "Rate") +
+      theme_minimal(base_size = 13)
+  })
 
   output$plot_age_area <- renderPlot({
     df <- req(by_age_f()) |>
-      group_by(case_month) |>
-      mutate(pct = as.numeric(n) / sum(as.numeric(n))) |>
-      ungroup()
+      dplyr::group_by(case_month) |>
+      dplyr::mutate(pct = n / sum(n)) |>
+      dplyr::ungroup()
 
     ggplot(df, aes(case_month, pct, fill = age_group)) +
       geom_area(alpha = 0.9) +
-      scale_y_continuous(labels = percent) +
+      scale_y_continuous(labels = scales::percent) +
       labs(x = NULL, y = "Share of monthly cases", fill = "Age group") +
       theme_minimal(base_size = 13)
   })
 
   output$plot_top_counties <- renderPlot({
     df <- req(selected_month_df()) |>
-      slice_head(n = input$top_n) |>
-      mutate(res_county = forcats::fct_reorder(res_county, n))
+      dplyr::slice_head(n = input$top_n) |>
+      dplyr::mutate(res_county = forcats::fct_reorder(res_county, n))
 
     ggplot(df, aes(res_county, n)) +
       geom_col() +
       coord_flip() +
-      scale_y_continuous(labels = label_number_si()) +
-      labs(x = NULL, y = "Cases (selected month)", title = NULL) +
+      scale_y_continuous(labels = label_si_safe()) +
+      labs(x = NULL, y = "Cases (selected month)") +
       theme_minimal(base_size = 13)
   })
 
@@ -351,8 +312,8 @@ server <- function(input, output, session) {
       datatable(df, rownames = FALSE, options = list(pageLength = 15))
     } else {
       cm <- co_county_month |>
-        filter(res_county == input$county_pick) |>
-        arrange(case_month)
+        dplyr::filter(res_county == input$county_pick) |>
+        dplyr::arrange(case_month)
       if (isTRUE(input$show_table_allmonths)) {
         datatable(cm, rownames = FALSE, options = list(pageLength = 15))
       } else {
