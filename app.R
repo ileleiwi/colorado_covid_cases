@@ -13,10 +13,13 @@ suppressPackageStartupMessages({
   library(scales)
   library(purrr)
   library(readr)
+  library(sf)
+  library(tigris)
+  library(leaflet)
 })
 
-# Show real errors during development
 options(shiny.sanitize.errors = FALSE)
+options(tigris_use_cache = TRUE)
 
 # -------------------------------
 # Data loading from cache
@@ -26,20 +29,19 @@ cache_read <- function(path) {
   readRDS(path)
 }
 
-# Required cached frames (coerce numerics immediately)
 co_month <- cache_read("cache/co_month.rds") |>
-  dplyr::mutate(case_month = as.Date(case_month),
-                n = suppressWarnings(as.numeric(n)))
+  mutate(case_month = as.Date(case_month),
+         n = suppressWarnings(as.numeric(n)))
 
 co_by_age <- cache_read("cache/co_by_age.rds") |>
-  dplyr::mutate(case_month = as.Date(case_month),
-                n = suppressWarnings(as.numeric(n)))
+  mutate(case_month = as.Date(case_month),
+         n = suppressWarnings(as.numeric(n)))
 
 co_county <- cache_read("cache/co_county.rds") |>
-  dplyr::mutate(n = suppressWarnings(as.numeric(n)),
-                county_fips_code = sprintf("%05s", county_fips_code))
+  mutate(n = suppressWarnings(as.numeric(n)),
+         county_fips_code = sprintf("%05s", county_fips_code))
 
-# County x month: bind yearly slices present in cache
+# County × month
 yr_files <- list.files("cache", pattern = "^co_county_month_\\d{4}\\.rds$", full.names = TRUE)
 if (length(yr_files) == 0L) {
   warning("No county-month cache files found (co_county_month_YYYY.rds). County Explorer will be limited.")
@@ -50,34 +52,42 @@ if (length(yr_files) == 0L) {
     res_county = character()
   )
 } else {
-  co_county_month <- purrr::map_dfr(yr_files, readRDS) |>
-    dplyr::mutate(
+  co_county_month <- map_dfr(yr_files, readRDS) |>
+    mutate(
       case_month = as.Date(case_month),
       county_fips_code = sprintf("%05s", county_fips_code),
       n = suppressWarnings(as.numeric(n))
     ) |>
-    # add county names from totals (lighter than returning from API)
-    dplyr::left_join(co_county |> dplyr::select(county_fips_code, res_county) |> dplyr::distinct(),
+    # add names from totals
+    left_join(co_county |> select(county_fips_code, res_county) |> distinct(),
               by = "county_fips_code") |>
-    dplyr::arrange(case_month, county_fips_code)
+    arrange(case_month, county_fips_code)
 }
 
-# Severe metrics cache — ensure object always exists
+# Severe metrics (always define object)
 severe <- local({
   p <- "cache/severe.rds"
   if (file.exists(p)) {
     tryCatch({
-      readRDS(p) |>
-        dplyr::mutate(case_month = as.Date(case_month))
+      readRDS(p) |> mutate(case_month = as.Date(case_month))
     }, error = function(e) NULL)
-  } else {
-    NULL
-  }
+  } else NULL
 })
 
 date_min <- min(co_month$case_month, na.rm = TRUE)
 date_max <- max(co_month$case_month, na.rm = TRUE)
 age_opts <- sort(unique(na.omit(co_by_age$age_group)))
+
+# -------------------------------
+# County geometry (sf) for Leaflet
+# -------------------------------
+co_shapes <- counties(state = "CO", year = 2023, class = "sf") |>
+  st_transform(4326) |>
+  transmute(
+    county_fips_code = GEOID,
+    county_name = NAME,
+    geometry
+  )
 
 # -------------------------------
 # Theming
@@ -116,8 +126,8 @@ ui <- page_navbar(
       ),
       card(
         full_screen = TRUE,
-        card_header("Monthly cases (Colorado)"),
-        plotOutput("plot_cases", height = 280),
+        card_header("Monthly cases (Colorado) — Interactive map"),
+        leafletOutput("map_monthly_cases", height = 360),
         hr(),
         if (is.data.frame(severe) && nrow(severe) > 0) {
           tagList(
@@ -155,8 +165,8 @@ ui <- page_navbar(
       ),
       card(
         full_screen = TRUE,
-        card_header("Top counties (selected month)"),
-        plotOutput("plot_top_counties", height = 340)
+        card_header("Top counties (selected month) — Interactive map"),
+        leafletOutput("map_top_counties", height = 360)
       ),
       card(
         full_screen = TRUE,
@@ -197,8 +207,7 @@ ui <- page_navbar(
           tags$li(code("cache/co_county_month_YYYY.rds"), " — county×month slices"),
           tags$li(code("cache/severe.rds"), " — hospitalization/death ratios by month")
         ),
-        p("To refresh data, re-run the Quarto analysis (or uncomment the API helpers and run this app with a CDC token set as ",
-          code("SOCRATA_APP_TOKEN_CDC"), ")."),
+        p("Maps use ", code("tigris"), " county geometries cached locally; interactive tiles via ", code("leaflet"), "."),
         p("Author: Ikaia Leleiwi • GitHub repo: https://github.com/ileleiwi/colorado_covid_cases")
       )
     )
@@ -208,7 +217,6 @@ ui <- page_navbar(
 # -------------------------------
 # Helpers + Server
 # -------------------------------
-# robust label helper (works on older/newer 'scales')
 label_si_safe <- function() {
   if ("label_number_si" %in% getNamespaceExports("scales")) {
     scales::label_number_si()
@@ -223,27 +231,30 @@ server <- function(input, output, session) {
   co_month_f <- reactive({
     req(input$date_range)
     co_month |>
-      dplyr::filter(case_month >= input$date_range[1],
-                    case_month <= input$date_range[2]) |>
-      dplyr::mutate(n = suppressWarnings(as.numeric(n)))
+      filter(case_month >= input$date_range[1],
+             case_month <= input$date_range[2]) |>
+      mutate(n = suppressWarnings(as.numeric(n)))
   })
 
   by_age_f <- reactive({
     req(input$date_range)
     co_by_age |>
-      dplyr::filter(case_month >= input$date_range[1],
-                    case_month <= input$date_range[2],
-                    age_group %in% input$age_sel) |>
-      dplyr::mutate(n = suppressWarnings(as.numeric(n)))
+      filter(case_month >= input$date_range[1],
+             case_month <= input$date_range[2],
+             age_group %in% input$age_sel) |>
+      mutate(n = suppressWarnings(as.numeric(n)))
   })
 
   selected_month_df <- reactive({
     req(input$month_pick)
-    co_county_month |>
-      dplyr::filter(case_month == as.Date(input$month_pick)) |>
-      dplyr::arrange(dplyr::desc(n))
+    df <- co_county_month |>
+      filter(case_month == as.Date(input$month_pick)) |>
+      arrange(desc(n))
+    validate(need(nrow(df) > 0, "No county data for the selected month."))
+    df
   })
 
+  # Build county picker choices
   observe({
     updateSelectizeInput(session, "county_pick",
       choices = unique(co_county$res_county), server = TRUE)
@@ -255,58 +266,111 @@ server <- function(input, output, session) {
                    multiple = FALSE, options = list(placeholder = "All counties"))
   })
 
-  # ---- plots ----
-  output$plot_cases <- renderPlot({
-    df <- req(co_month_f())
-    validate(need(nrow(df) > 0, "No data for the selected range."))
-
-    ggplot(df, aes(x = case_month, y = n)) +
-      geom_line(size = 0.8) +
-      scale_y_continuous(labels = label_si_safe()) +
-      labs(x = NULL, y = "Monthly cases") +
-      theme_minimal(base_size = 13)
+  # ---- Interactive map: Monthly cases (last month in selected range) ----
+  map_month_df <- reactive({
+    rng <- req(input$date_range)
+    map_month <- max(rng, na.rm = TRUE)
+    df <- co_county_month |>
+      filter(case_month == as.Date(map_month)) |>
+      group_by(county_fips_code) |>
+      summarise(n = sum(as.numeric(n), na.rm = TRUE), .groups = "drop")
+    left_join(co_shapes, df, by = "county_fips_code") |>
+      mutate(n = coalesce(n, 0))
   })
 
+  output$map_monthly_cases <- renderLeaflet({
+    sf_df <- req(map_month_df())
+    validate(need(nrow(sf_df) > 0, "No data for selected period."))
+    pal <- colorNumeric("viridis", domain = sf_df$n, na.color = "#f0f0f0")
+    m <- leaflet(sf_df, options = leafletOptions(minZoom = 5, maxZoom = 12)) |>
+      addProviderTiles(providers$CartoDB.Positron) |>
+      addPolygons(
+        fillColor = ~pal(n),
+        fillOpacity = 0.85,
+        color = "#ffffff",
+        weight = 0.6,
+        opacity = 1,
+        label = ~sprintf("%s County<br/>Cases: %s",
+                         county_name, scales::label_number_si()(n)) |>
+                lapply(htmltools::HTML),
+        highlightOptions = highlightOptions(weight = 2, color = "#333333", bringToFront = TRUE)
+      ) |>
+      addLegend("bottomright", pal = pal, values = ~n,
+                title = paste0("Cases (", format(max(req(input$date_range)), "%Y-%m"), ")"),
+                labFormat = labelFormat(transform = label_number_si()))
+    m
+  })
+
+  # ---- Interactive map: Top counties (selected month) ----
+  map_top_df <- reactive({
+    df <- selected_month_df()
+    left_join(co_shapes, df, by = "county_fips_code") |>
+      mutate(n = coalesce(n, 0))
+  })
+
+  output$map_top_counties <- renderLeaflet({
+    sf_df <- req(map_top_df())
+    validate(need(nrow(sf_df) > 0, "No county data for selected month."))
+    pal <- colorNumeric("viridis", domain = sf_df$n, na.color = "#f0f0f0")
+
+    # compute top N set
+    top_ids <- sf_df |>
+      st_drop_geometry() |>
+      arrange(desc(n)) |>
+      slice_head(n = input$top_n) |>
+      pull(county_fips_code)
+
+    leaflet(sf_df, options = leafletOptions(minZoom = 5, maxZoom = 12)) |>
+      addProviderTiles(providers$CartoDB.Positron) |>
+      addPolygons(
+        fillColor = ~pal(n),
+        fillOpacity = 0.85,
+        color = "#ffffff",
+        weight = 0.6,
+        opacity = 1,
+        label = ~sprintf("%s County<br/>Cases: %s",
+                         county_name, scales::label_number_si()(n)) |>
+                lapply(htmltools::HTML),
+        highlightOptions = highlightOptions(weight = 2, color = "#333333", bringToFront = TRUE)
+      ) |>
+      addPolygons(
+        data = sf_df[sf_df$county_fips_code %in% top_ids, ],
+        fill = FALSE, color = "#ff6a00", weight = 3, opacity = 1
+      ) |>
+      addLegend("bottomright", pal = pal, values = ~n,
+                title = paste0("Cases (", format(as.Date(input$month_pick), "%Y-%m"), ")"),
+                labFormat = labelFormat(transform = label_number_si()))
+  })
+
+  # ---- severity plot ----
   output$plot_severe <- renderPlot({
     req(is.data.frame(severe), nrow(severe) > 0, input$date_range)
     df <- severe |>
-      dplyr::filter(case_month >= input$date_range[1],
-                    case_month <= input$date_range[2]) |>
-      tidyr::pivot_longer(dplyr::all_of(c("hosp_rate","death_rate")),
-                          names_to = "metric", values_to = "rate")
+      filter(case_month >= input$date_range[1],
+             case_month <= input$date_range[2]) |>
+      pivot_longer(c("hosp_rate","death_rate"),
+                   names_to = "metric", values_to = "rate")
 
     ggplot(df, aes(case_month, rate, color = metric)) +
       geom_line(size = 0.8) +
-      scale_y_continuous(labels = scales::percent_format(accuracy = 0.1)) +
+      scale_y_continuous(labels = percent_format(accuracy = 0.1)) +
       scale_color_manual(NULL, values = c("#2c7fb8", "#d95f0e"),
                          labels = c("Hospitalization ratio", "Death ratio")) +
       labs(x = NULL, y = "Rate") +
       theme_minimal(base_size = 13)
   })
 
+  # ---- age area plot ----
   output$plot_age_area <- renderPlot({
     df <- req(by_age_f()) |>
-      dplyr::group_by(case_month) |>
-      dplyr::mutate(pct = n / sum(n)) |>
-      dplyr::ungroup()
+      group_by(case_month) |>
+      mutate(pct = n / sum(n)) |>
+      ungroup()
 
     ggplot(df, aes(case_month, pct, fill = age_group)) +
       geom_area(alpha = 0.9) +
-      scale_y_continuous(labels = scales::percent) +
+      scale_y_continuous(labels = percent) +
       labs(x = NULL, y = "Share of monthly cases", fill = "Age group") +
-      theme_minimal(base_size = 13)
-  })
-
-  output$plot_top_counties <- renderPlot({
-    df <- req(selected_month_df()) |>
-      dplyr::slice_head(n = input$top_n) |>
-      dplyr::mutate(res_county = forcats::fct_reorder(res_county, n))
-
-    ggplot(df, aes(res_county, n)) +
-      geom_col() +
-      coord_flip() +
-      scale_y_continuous(labels = label_si_safe()) +
-      labs(x = NULL, y = "Cases (selected month)") +
       theme_minimal(base_size = 13)
   })
 
@@ -317,8 +381,8 @@ server <- function(input, output, session) {
       datatable(df, rownames = FALSE, options = list(pageLength = 15))
     } else {
       cm <- co_county_month |>
-        dplyr::filter(res_county == input$county_pick) |>
-        dplyr::arrange(case_month)
+        filter(res_county == input$county_pick) |>
+        arrange(case_month)
       if (isTRUE(input$show_table_allmonths)) {
         datatable(cm, rownames = FALSE, options = list(pageLength = 15))
       } else {
