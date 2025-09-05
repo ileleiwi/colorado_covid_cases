@@ -1,6 +1,6 @@
 # Colorado COVID case surveillance (CDC Socrata) — Shiny
 # Expects cached RDS files under ./cache produced by your Quarto analysis:
-#   co_month.rds, co_by_age.rds, co_county.rds, co_county_month_YYYY.rds, [optional] severe.rds
+#   co_month.rds, co_by_age.rds, co_county.rds, co_county_month_YYYY.rds, severe.rds
 
 suppressPackageStartupMessages({
   library(shiny)
@@ -50,26 +50,30 @@ if (length(yr_files) == 0L) {
     res_county = character()
   )
 } else {
-  co_county_month <- map_dfr(yr_files, readRDS) |>
-    mutate(
+  co_county_month <- purrr::map_dfr(yr_files, readRDS) |>
+    dplyr::mutate(
       case_month = as.Date(case_month),
       county_fips_code = sprintf("%05s", county_fips_code),
       n = suppressWarnings(as.numeric(n))
     ) |>
     # add county names from totals (lighter than returning from API)
-    left_join(co_county |> select(county_fips_code, res_county) |> distinct(),
+    dplyr::left_join(co_county |> dplyr::select(county_fips_code, res_county) |> dplyr::distinct(),
               by = "county_fips_code") |>
-    arrange(case_month, county_fips_code)
+    dplyr::arrange(case_month, county_fips_code)
 }
 
-# Optional severity cache (if you saved one during Quarto)
-severe_path <- "cache/severe.rds"
-severe <- if (file.exists(severe_path)) {
-  readRDS(severe_path) |>
-    mutate(case_month = as.Date(case_month))
-} else {
-  NULL
-}
+# Severe metrics cache — ensure object always exists
+severe <- local({
+  p <- "cache/severe.rds"
+  if (file.exists(p)) {
+    tryCatch({
+      readRDS(p) |>
+        dplyr::mutate(case_month = as.Date(case_month))
+    }, error = function(e) NULL)
+  } else {
+    NULL
+  }
+})
 
 date_min <- min(co_month$case_month, na.rm = TRUE)
 date_max <- max(co_month$case_month, na.rm = TRUE)
@@ -92,7 +96,7 @@ app_theme <- bs_theme(
 ui <- page_navbar(
   title  = "Colorado COVID (CDC) — API Summaries",
   theme  = app_theme,
-  collapsible = TRUE,
+  navbar_options = navbar_options(collapsible = TRUE),
 
   nav_panel(
     "Overview",
@@ -115,15 +119,16 @@ ui <- page_navbar(
         card_header("Monthly cases (Colorado)"),
         plotOutput("plot_cases", height = 280),
         hr(),
-        if (!is.null(severe)) {
+        if (is.data.frame(severe) && nrow(severe) > 0) {
           tagList(
             card_header("Severity proxies: hospitalization & death ratios"),
             plotOutput("plot_severe", height = 280)
           )
         } else {
           card_body(
-            p(em("Hospitalization/death ratios not cached — run the Quarto analysis to generate ",
-                 code("cache/severe.rds"), " or uncomment API helpers to fetch on the fly."))
+            p(em("Hospitalization/death ratios not found in ",
+                 code("cache/severe.rds"),
+                 ". Re-run the Quarto analysis to generate it."))
           )
         }
       )
@@ -190,7 +195,7 @@ ui <- page_navbar(
           tags$li(code("cache/co_by_age.rds"), " — monthly counts by age group"),
           tags$li(code("cache/co_county.rds"), " — county totals"),
           tags$li(code("cache/co_county_month_YYYY.rds"), " — county×month slices"),
-          tags$li(code("cache/severe.rds"), " — optional hospitalization/death ratios by month")
+          tags$li(code("cache/severe.rds"), " — hospitalization/death ratios by month")
         ),
         p("To refresh data, re-run the Quarto analysis (or uncomment the API helpers and run this app with a CDC token set as ",
           code("SOCRATA_APP_TOKEN_CDC"), ")."),
@@ -263,7 +268,7 @@ server <- function(input, output, session) {
   })
 
   output$plot_severe <- renderPlot({
-    req(severe)
+    req(is.data.frame(severe), nrow(severe) > 0, input$date_range)
     df <- severe |>
       dplyr::filter(case_month >= input$date_range[1],
                     case_month <= input$date_range[2]) |>
