@@ -293,8 +293,12 @@ server <- function(input, output, session) {
   })
 
   output$map_monthly_cases <- renderLeaflet({
-    sf_df <- req(map_month_df())
+    sf_df <- req(map_month_df()) |>
+      dplyr::mutate(
+        tooltip = sprintf("<b>%s County</b><br/>Cases: %s", county_name, fmt_int(n))
+      )
     validate(need(nrow(sf_df) > 0, "No data for selected period."))
+
     dom <- pal_domain(sf_df$n)
     pal <- colorNumeric("viridis", domain = dom, na.color = "#f0f0f0")
 
@@ -306,12 +310,14 @@ server <- function(input, output, session) {
         color = "#ffffff",
         weight = 0.6,
         opacity = 1,
-        label = ~htmltools::HTML(sprintf("<b>%s County</b><br/>Cases: %s", county_name, fmt_int(n))),
+        label = lapply(sf_df$tooltip, htmltools::HTML),   # <-- one label per feature
+        labelOptions = labelOptions(direction = "auto"),
         highlightOptions = highlightOptions(weight = 2, color = "#333333", bringToFront = TRUE)
       ) |>
       addLegend("bottomright", pal = pal, values = sf_df$n,
                 title = paste0("Cases (", format(max(req(input$date_range)), "%Y-%m"), ")"))
   })
+
 
   # ---- Map: Top counties (selected month) ----
   map_top_df <- reactive({
@@ -322,16 +328,21 @@ server <- function(input, output, session) {
   })
 
   output$map_top_counties <- renderLeaflet({
-    sf_df <- req(map_top_df())
-    validate(need(nrow(sf_df) > 0, "No county data for selected month."))
-    dom <- pal_domain(sf_df$n)
-    pal <- colorNumeric("viridis", domain = dom, na.color = "#f0f0f0")
+  sf_df <- req(map_top_df()) |>
+    dplyr::mutate(
+      tooltip = sprintf("<b>%s County</b><br/>Cases: %s", county_name, fmt_int(n))
+    )
+  validate(need(nrow(sf_df) > 0, "No county data for selected month."))
 
-    top_ids <- sf_df |>
-      st_drop_geometry() |>
-      arrange(desc(n)) |>
-      slice_head(n = input$top_n) |>
-      pull(county_fips_code)
+  dom <- pal_domain(sf_df$n)
+  pal <- colorNumeric("viridis", domain = dom, na.color = "#f0f0f0")
+
+  # compute top N set for outline
+  top_ids <- sf_df |>
+    sf::st_drop_geometry() |>
+    dplyr::arrange(dplyr::desc(n)) |>
+    dplyr::slice_head(n = input$top_n) |>
+    dplyr::pull(county_fips_code)
 
     leaflet(sf_df, options = leafletOptions(minZoom = 5, maxZoom = 12)) |>
       addProviderTiles(providers$CartoDB.Positron) |>
@@ -341,7 +352,8 @@ server <- function(input, output, session) {
         color = "#ffffff",
         weight = 0.6,
         opacity = 1,
-        label = ~htmltools::HTML(sprintf("<b>%s County</b><br/>Cases: %s", county_name, fmt_int(n))),
+        label = lapply(sf_df$tooltip, htmltools::HTML),  # <-- one label per feature
+        labelOptions = labelOptions(direction = "auto"),
         highlightOptions = highlightOptions(weight = 2, color = "#333333", bringToFront = TRUE)
       ) |>
       addPolygons(
@@ -351,6 +363,7 @@ server <- function(input, output, session) {
       addLegend("bottomright", pal = pal, values = sf_df$n,
                 title = paste0("Cases (", format(as.Date(input$month_pick), "%Y-%m"), ")"))
   })
+
 
   # ---- severity plot ----
   output$plot_severe <- renderPlot({
