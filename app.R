@@ -1,5 +1,5 @@
 # Colorado COVID case surveillance (CDC Socrata) — Shiny
-# Expects cached RDS files under ./cache produced by your Quarto analysis:
+# Cached inputs under ./cache:
 #   co_month.rds, co_by_age.rds, co_county.rds, co_county_month_YYYY.rds, severe.rds
 
 suppressPackageStartupMessages({
@@ -58,13 +58,12 @@ if (length(yr_files) == 0L) {
       county_fips_code = sprintf("%05s", county_fips_code),
       n = suppressWarnings(as.numeric(n))
     ) |>
-    # add names from totals
     left_join(co_county |> select(county_fips_code, res_county) |> distinct(),
               by = "county_fips_code") |>
     arrange(case_month, county_fips_code)
 }
 
-# Severe metrics (always define object)
+# Severe metrics — ensure object always exists
 severe <- local({
   p <- "cache/severe.rds"
   if (file.exists(p)) {
@@ -87,7 +86,22 @@ co_shapes <- counties(state = "CO", year = 2023, class = "sf") |>
     county_fips_code = GEOID,
     county_name = NAME,
     geometry
-  )
+  ) |>
+  st_make_valid()
+
+# Simple numeric pretty-printer for labels
+fmt_int <- function(x) formatC(x, format = "f", digits = 0, big.mark = ",")
+
+# Palette domain helper robust to all-NA or all-equal
+pal_domain <- function(x) {
+  rng <- range(x, na.rm = TRUE)
+  if (!is.finite(rng[1])) return(c(0, 1))        # all NA
+  if (diff(rng) == 0) {
+    hi <- if (rng[2] == 0) 1 else rng[2] * 1.05  # expand flat domain
+    return(c(min(0, rng[1]), hi))
+  }
+  rng
+}
 
 # -------------------------------
 # Theming
@@ -254,19 +268,18 @@ server <- function(input, output, session) {
     df
   })
 
-  # Build county picker choices
+  # County picker
   observe({
     updateSelectizeInput(session, "county_pick",
       choices = unique(co_county$res_county), server = TRUE)
   })
-
   output$county_picker_ui <- renderUI({
     selectizeInput("county_pick", "Focus county (optional):",
                    choices = unique(co_county$res_county), selected = NULL,
                    multiple = FALSE, options = list(placeholder = "All counties"))
   })
 
-  # ---- Interactive map: Monthly cases (last month in selected range) ----
+  # ---- Map: Monthly cases (last month in selected range) ----
   map_month_df <- reactive({
     rng <- req(input$date_range)
     map_month <- max(rng, na.rm = TRUE)
@@ -275,14 +288,17 @@ server <- function(input, output, session) {
       group_by(county_fips_code) |>
       summarise(n = sum(as.numeric(n), na.rm = TRUE), .groups = "drop")
     left_join(co_shapes, df, by = "county_fips_code") |>
-      mutate(n = coalesce(n, 0))
+      mutate(n = coalesce(n, 0)) |>
+      st_make_valid()
   })
 
   output$map_monthly_cases <- renderLeaflet({
     sf_df <- req(map_month_df())
     validate(need(nrow(sf_df) > 0, "No data for selected period."))
-    pal <- colorNumeric("viridis", domain = sf_df$n, na.color = "#f0f0f0")
-    m <- leaflet(sf_df, options = leafletOptions(minZoom = 5, maxZoom = 12)) |>
+    dom <- pal_domain(sf_df$n)
+    pal <- colorNumeric("viridis", domain = dom, na.color = "#f0f0f0")
+
+    leaflet(sf_df, options = leafletOptions(minZoom = 5, maxZoom = 12)) |>
       addProviderTiles(providers$CartoDB.Positron) |>
       addPolygons(
         fillColor = ~pal(n),
@@ -290,30 +306,27 @@ server <- function(input, output, session) {
         color = "#ffffff",
         weight = 0.6,
         opacity = 1,
-        label = ~sprintf("%s County<br/>Cases: %s",
-                         county_name, scales::label_number_si()(n)) |>
-                lapply(htmltools::HTML),
+        label = ~htmltools::HTML(sprintf("<b>%s County</b><br/>Cases: %s", county_name, fmt_int(n))),
         highlightOptions = highlightOptions(weight = 2, color = "#333333", bringToFront = TRUE)
       ) |>
-      addLegend("bottomright", pal = pal, values = ~n,
-                title = paste0("Cases (", format(max(req(input$date_range)), "%Y-%m"), ")"),
-                labFormat = labelFormat(transform = label_number_si()))
-    m
+      addLegend("bottomright", pal = pal, values = sf_df$n,
+                title = paste0("Cases (", format(max(req(input$date_range)), "%Y-%m"), ")"))
   })
 
-  # ---- Interactive map: Top counties (selected month) ----
+  # ---- Map: Top counties (selected month) ----
   map_top_df <- reactive({
     df <- selected_month_df()
     left_join(co_shapes, df, by = "county_fips_code") |>
-      mutate(n = coalesce(n, 0))
+      mutate(n = coalesce(n, 0)) |>
+      st_make_valid()
   })
 
   output$map_top_counties <- renderLeaflet({
     sf_df <- req(map_top_df())
     validate(need(nrow(sf_df) > 0, "No county data for selected month."))
-    pal <- colorNumeric("viridis", domain = sf_df$n, na.color = "#f0f0f0")
+    dom <- pal_domain(sf_df$n)
+    pal <- colorNumeric("viridis", domain = dom, na.color = "#f0f0f0")
 
-    # compute top N set
     top_ids <- sf_df |>
       st_drop_geometry() |>
       arrange(desc(n)) |>
@@ -328,18 +341,15 @@ server <- function(input, output, session) {
         color = "#ffffff",
         weight = 0.6,
         opacity = 1,
-        label = ~sprintf("%s County<br/>Cases: %s",
-                         county_name, scales::label_number_si()(n)) |>
-                lapply(htmltools::HTML),
+        label = ~htmltools::HTML(sprintf("<b>%s County</b><br/>Cases: %s", county_name, fmt_int(n))),
         highlightOptions = highlightOptions(weight = 2, color = "#333333", bringToFront = TRUE)
       ) |>
       addPolygons(
         data = sf_df[sf_df$county_fips_code %in% top_ids, ],
         fill = FALSE, color = "#ff6a00", weight = 3, opacity = 1
       ) |>
-      addLegend("bottomright", pal = pal, values = ~n,
-                title = paste0("Cases (", format(as.Date(input$month_pick), "%Y-%m"), ")"),
-                labFormat = labelFormat(transform = label_number_si()))
+      addLegend("bottomright", pal = pal, values = sf_df$n,
+                title = paste0("Cases (", format(as.Date(input$month_pick), "%Y-%m"), ")"))
   })
 
   # ---- severity plot ----
