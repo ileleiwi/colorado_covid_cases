@@ -1,12 +1,11 @@
 ---
 title: "Colorado COVID-19: CDC API Analysis (Cache-First)"
 format:
-  html:
+  pdf:
     theme: flatly
     toc: true
     code-fold: show
     df-print: paged
-  pdf: default
 execute:
   echo: true
   warning: true
