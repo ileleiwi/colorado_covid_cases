@@ -17,7 +17,8 @@ execute:
 suppressPackageStartupMessages({
   library(dplyr); library(tidyr); library(lubridate); library(ggplot2)
   library(httr); library(jsonlite); library(tibble); library(purrr)
-  library(readr); library(scales); library(stringr)
+  library(readr); library(scales); library(stringr); library(forecast);
+  library(lubridate)
 })
 
 options(timeout = 60)  # cap any single HTTP call
@@ -338,9 +339,9 @@ summary(severe)
 ## Quick visuals (sanity checks)
 
 ```{r plots, fig.width=8, fig.height=4}
-ggplot(co_month, aes(case_month, n)) +
-  geom_line(size = 0.8) +
-  scale_y_continuous(labels = label_si_safe()) +
+co_month |>
+ggplot(aes(case_month, n)) +
+  geom_line(linewidth = 0.8) +
   labs(title = "Colorado Monthly Cases", x = NULL, y = "Count") +
   theme_minimal(base_size = 13)
 ```
@@ -367,8 +368,129 @@ co_county_month |>
   ggplot(aes(res_county, n)) +
   geom_col() +
   coord_flip() +
-  scale_y_continuous(labels = label_si_safe()) +
   labs(title = paste("Top counties in", format(latest_month, "%Y-%m")),
        x = NULL, y = "Cases") +
   theme_minimal(base_size = 13)
+```
+
+```{r}
+suppressPackageStartupMessages({ library(sf); library(tigris); library(dplyr); library(ggplot2); library(scales) })
+options(tigris_use_cache = TRUE)
+
+# 1) Pick a month to map (latest available by default)
+stopifnot(exists("co_county_month"), nrow(co_county_month) > 0)
+map_month <- max(co_county_month$case_month, na.rm = TRUE)
+
+# 2) Get Colorado county polygons (cached locally by tigris)
+co_shapes <- tigris::counties(state = "CO", year = 2023, class = "sf") |>
+  dplyr::transmute(county_fips_code = GEOID, geometry)
+
+# 3) Aggregate counts for the selected month
+df_month <- co_county_month |>
+  dplyr::filter(case_month == map_month) |>
+  dplyr::group_by(county_fips_code) |>
+  dplyr::summarise(n = sum(as.numeric(n), na.rm = TRUE), .groups = "drop")
+
+# 4) Join counts to shapes; missing counties get 0
+map_df <- co_shapes |>
+  dplyr::left_join(df_month, by = "county_fips_code") |>
+  dplyr::mutate(n = dplyr::coalesce(n, 0))
+
+# 5) Plot
+ggplot(map_df) +
+  geom_sf(aes(fill = n), color = "white", linewidth = 0.2) +
+  scale_fill_viridis_c(labels = label_number(), name = paste0("Cases (", format(map_month, "%Y-%m"), ")")) +
+  labs(
+    title = "Colorado COVID-19 — County-level cases",
+    subtitle = paste("Month:", format(map_month, "%B %Y")),
+    caption = "Counts are monthly totals from CDC SODA (cached)."
+  ) +
+  theme_minimal(base_size = 13) +
+  theme(
+    axis.text = element_blank(),
+    axis.title = element_blank(),
+    panel.grid = element_blank(),
+    legend.position = "right"
+  )
+
+```
+
+```{r}
+severe |>
+  mutate(case_month = ymd(case_month)) |>
+  arrange(case_month) |> 
+  separate(case_month,
+           into = c("year", "month", "day"),
+           sep = "-",
+           remove = FALSE) |> 
+  ggplot(aes(x = year, y = month)) +
+  geom_point()
+  
+
+df <- severe |>
+  mutate(case_month = ymd(case_month)) |>
+  arrange(case_month) |> 
+  transmute(case_month, n = as.numeric(n)) |>
+  mutate(ema = TTR::EMA(n, ratio = 0.2))
+
+df |>
+  select(case_month, n, ema) |>
+  pivot_longer(cols = c("ema", "n"),
+               names_to = "type",
+               values_to = "value") |>
+  ggplot(aes(x = case_month, y = value, group = type)) +
+    geom_line(aes(color = type),
+              size = 0.8) +
+  labs(x = NULL, 
+       y = "Cases",
+       color = NULL) +
+  theme_bw()
+```
+
+```{r}
+library(forecast)  # install.packages("forecast")
+
+# make a monthly ts object (frequency=12)
+start_year  <- lubridate::year(min(df$case_month, na.rm = TRUE))
+start_month <- lubridate::month(min(df$case_month, na.rm = TRUE))
+y_ts <- ts(df$n, start = c(start_year, start_month), frequency = 12)
+
+# fit ARIMA on log1p scale
+fit <- forecast::auto.arima(log1p(y_ts), stepwise = TRUE, approximation = FALSE)
+
+# horizon to Dec 2024
+last_obs <- max(df$case_month, na.rm = TRUE)
+h <- max(0, (12 * (2024 - lubridate::year(last_obs))) +
+              (12 - lubridate::month(last_obs)))  # months until Dec 2024
+
+fc <- forecast::forecast(fit, h = h)
+
+# back-transform and build a tidy frame
+future_dates <- seq(from = last_obs %m+% months(1), by = "month", length.out = h)
+pred <- tibble::tibble(
+  case_month = future_dates,
+  n_hat = expm1(as.numeric(fc$mean)),
+  lo80  = expm1(as.numeric(fc$lower[, "80%"])),
+  hi80  = expm1(as.numeric(fc$upper[, "80%"])),
+  lo95  = expm1(as.numeric(fc$lower[, "95%"])),
+  hi95  = expm1(as.numeric(fc$upper[, "95%"]))
+)
+
+# combine actuals + forecast for plotting
+plot_df <- dplyr::bind_rows(
+  df %>% transmute(case_month, value = n, type = "actual"),
+  pred %>% transmute(case_month, value = n_hat, type = "forecast")
+)
+
+ggplot() +
+  geom_ribbon(data = pred, aes(case_month, ymin = lo80, ymax = hi80), alpha = 0.2, fill = "#2c7fb8") +
+  geom_ribbon(data = pred, aes(case_month, ymin = lo95, ymax = hi95), alpha = 0.12, fill = "#2c7fb8") +
+  geom_line(data = plot_df, aes(case_month, value, color = type), linewidth = 0.9) +
+  scale_color_manual(values = c(actual = "#0d6efd", forecast = "#d95f0e")) +
+  scale_y_continuous(labels = scales::label_number()) +
+  labs(x = NULL, y = "Cases", color = NULL,
+       title = "Colorado COVID monthly cases — actuals & ARIMA forecast to Dec 2024") +
+  theme_minimal(base_size = 13)
+
+
 ```
